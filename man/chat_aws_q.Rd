@@ -23,7 +23,8 @@ chat_aws_q(
 \arguments{
 \item{application_id}{Q Business applicationId (required, 36-char ID).}
 
-\item{system_prompt}{A system prompt to set the behavior of the assistant.}
+\item{system_prompt}{Optional system prompt. Q Chat has no native "system";
+we inline this into the first user message for now.}
 
 \item{base_url}{Optional base URL. Default: https://qbusiness.\{region\}.amazonaws.com}
 
@@ -31,7 +32,7 @@ chat_aws_q(
 
 \item{user_id}{Optional Q userId associated to the chat input.}
 
-\item{user_groups}{Optional character vector of user groups (used as a comma-separated query param).}
+\item{user_groups}{Optional character vector of user groups (comma-joined into query).}
 
 \item{client_token}{Optional idempotency token. If NULL, a random hex token is generated.}
 
@@ -39,7 +40,7 @@ chat_aws_q(
 
 \item{parent_message_id}{Optional parent message ID (to thread replies).}
 
-\item{params}{Common model params; mostly ignored by Q Chat (kept for API symmetry).}
+\item{params}{Common model params; usually ignored by Q Chat (kept for API symmetry).}
 
 \item{api_args}{Named list merged into request body (e.g. configurationEvent, attachmentEvent).}
 

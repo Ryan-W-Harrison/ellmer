@@ -4,23 +4,25 @@
 #' @include tools-def.R
 NULL
 
-# =========================
-# Public constructor (chat)
-# =========================
+# ============================================================================
+# Public constructor
+# ============================================================================
 
 #' Chat with Amazon Q Business (QBusiness Chat API)
 #'
 #' Uses AWS SigV4 auth via \{paws.common\}. If you use AWS SSO, run `aws sso login`.
 #'
 #' @param application_id Q Business applicationId (required, 36-char ID).
-#' @param profile AWS profile name (optional).
+#' @param system_prompt Optional system prompt. Q Chat has no native "system";
+#'   we inline this into the first user message for now.
 #' @param base_url Optional base URL. Default: https://qbusiness.\{region\}.amazonaws.com
+#' @param profile AWS profile name (optional).
 #' @param user_id Optional Q userId associated to the chat input.
-#' @param user_groups Optional character vector of user groups (used as a comma-separated query param).
+#' @param user_groups Optional character vector of user groups (comma-joined into query).
 #' @param client_token Optional idempotency token. If NULL, a random hex token is generated.
 #' @param conversation_id Optional conversationId to continue a thread.
 #' @param parent_message_id Optional parent message ID (to thread replies).
-#' @param params Common model params; mostly ignored by Q Chat (kept for API symmetry).
+#' @param params Common model params; usually ignored by Q Chat (kept for API symmetry).
 #' @param api_args Named list merged into request body (e.g. configurationEvent, attachmentEvent).
 #' @param api_headers Named character vector of extra headers.
 #' @inheritParams chat_openai
@@ -65,9 +67,9 @@ chat_aws_q <- function(
   Chat$new(provider = provider, system_prompt = system_prompt, echo = echo)
 }
 
-# =========================
+# ============================================================================
 # Provider constructor/class
-# =========================
+# ============================================================================
 
 provider_aws_qbusiness <- function(
   base_url,
@@ -100,16 +102,22 @@ provider_aws_qbusiness <- function(
   }
   client_token <- client_token %||% generate_client_token()
 
-  # Store user_groups as a single comma-separated string for simple property typing
-  if (is.null(user_groups)) {
-    user_groups_str <- NULL
+  user_groups_str <- if (is.null(user_groups)) {
+    NULL
   } else {
-    user_groups_str <- paste0(as.character(user_groups), collapse = ",")
+    paste0(as.character(user_groups), collapse = ",")
   }
 
+  # IMPORTANT: Provider requires a 'model' property; Q doesn't use it, so set "".
   ProviderAWSQBusiness(
     name = "AWS/QBusiness",
+    model = "",
     base_url = base_url,
+    params = params,
+    extra_args = extra_args,
+    extra_headers = extra_headers,
+    credentials = NULL,
+    # subclass props
     profile = profile,
     region = credentials$region,
     application_id = application_id,
@@ -118,10 +126,7 @@ provider_aws_qbusiness <- function(
     client_token = client_token,
     conversation_id = conversation_id,
     parent_message_id = parent_message_id,
-    cache = cache,
-    params = params,
-    extra_args = extra_args,
-    extra_headers = extra_headers
+    cache = cache
   )
 }
 
@@ -141,9 +146,9 @@ ProviderAWSQBusiness <- new_class(
   )
 )
 
-# =========================
-# Base request & error hooks
-# =========================
+# ============================================================================
+# Base request & error handling
+# ============================================================================
 
 method(base_request, ProviderAWSQBusiness) <- function(provider) {
   creds <- paws_credentials(provider@profile, provider@cache)
@@ -166,7 +171,10 @@ method(base_request, ProviderAWSQBusiness) <- function(provider) {
 method(base_request_error, ProviderAWSQBusiness) <- function(provider, req) {
   req_error(req, body = function(resp) {
     b <- tryCatch(resp_body_json(resp), error = function(e) list())
-    b$message %||% b$errorMessage %||% b$Message %||% "Amazon Q Business error"
+    b$message %||%
+      b$errorMessage %||%
+      b$Message %||%
+      http_status_desc(status_code(resp))
   })
 }
 
@@ -184,9 +192,9 @@ method(chat_params, ProviderAWSQBusiness) <- function(provider, params) {
   )
 }
 
-# =========================
-# Build the chat request
-# =========================
+# ============================================================================
+# Build the chat request (override default Provider method)
+# ============================================================================
 
 method(chat_request, ProviderAWSQBusiness) <- function(
   provider,
@@ -215,13 +223,12 @@ method(chat_request, ProviderAWSQBusiness) <- function(
   }
   req <- req_url_query(req, !!!compact(q))
 
-  # Q Chat "events" body: we’ll send textEvent + endOfInputEvent (+ any api_args)
-  # System prompt: Q has no system field; inline into first user message if present.
+  # Body is a sequence of "events": textEvent / configurationEvent / attachmentEvent / endOfInputEvent
+  # System prompt: inline into first user message (Q has no native 'system' field).
   msgs <- compact(as_json(provider, turns))
 
   if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
     sys <- turns[[1]]@text
-    # If next is user, prepend; else send as its own textEvent
     if (length(msgs) >= 2 && identical(msgs[[2]]$role, "user")) {
       if (
         length(msgs[[2]]$content) > 0 && !is.null(msgs[[2]]$content[[1]]$text)
@@ -233,16 +240,13 @@ method(chat_request, ProviderAWSQBusiness) <- function(
         )
       }
     } else {
-      # We'll include as a standalone message below if no user text is found
-      # by just setting textEvent<-sys
-      # (handled by fallthrough if last_user is NULL)
+      # If there is no immediate user message, we fall back below to send sys as textEvent
     }
-    # Drop the system turn from consideration
     keep <- !vapply(turns, is_system_turn, logical(1))
     msgs <- msgs[keep]
   }
 
-  # Find the last user message's text to send as textEvent
+  # Take only the last user message as the input for this call
   last_user_text <- NULL
   if (length(msgs)) {
     for (i in rev(seq_along(msgs))) {
@@ -262,29 +266,25 @@ method(chat_request, ProviderAWSQBusiness) <- function(
   if (!is.null(last_user_text) && nzchar(last_user_text)) {
     body$textEvent <- list(userMessage = last_user_text)
   } else if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
-    # If only a system prompt existed, send it so conversation starts
     body$textEvent <- list(userMessage = turns[[1]]@text)
   }
 
-  # Optional extras (e.g., configurationEvent, attachmentEvent, actionExecutionEvent)
-  # pass via api_args = list(configurationEvent = list(chatMode = "qa"), ...)
+  # Optional: configurationEvent / attachmentEvent / actionExecutionEvent via api_args
   body <- modify_list(body, provider@extra_args)
 
-  # Required to terminate input stream
+  # Required end-of-input marker
   body$endOfInputEvent <- list()
 
   req <- req_body_json(req, compact(body))
   req <- req_headers(req, !!!provider@extra_headers)
-
   req
 }
 
-# =========================
-# Streaming helpers
-# =========================
+# ============================================================================
+# Streaming helpers (Q uses AWS event streams; reuse the Bedrock reader)
+# ============================================================================
 
 method(chat_resp_stream, ProviderAWSQBusiness) <- function(provider, resp) {
-  # Reuse the existing AWS event-stream reader you already use for Bedrock
   resp_stream_aws(resp)
 }
 
@@ -293,7 +293,6 @@ method(stream_parse, ProviderAWSQBusiness) <- function(provider, event) {
     return()
   }
   body <- event$body
-  # Normalize header key for event type
   evt <- event$headers$`:event-type` %||%
     event$headers$`x-amz-event-type` %||%
     NULL
@@ -304,7 +303,7 @@ method(stream_parse, ProviderAWSQBusiness) <- function(provider, event) {
 }
 
 method(stream_text, ProviderAWSQBusiness) <- function(provider, event) {
-  # Q returns running text in textEvent.systemMessage; final text may appear in metadataEvent.finalTextMessage
+  # Streaming text arrives in textEvent.systemMessage; final text may be in metadataEvent.finalTextMessage
   if (!is.null(event$textEvent) && !is.null(event$textEvent$systemMessage)) {
     return(event$textEvent$systemMessage)
   }
@@ -326,12 +325,10 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
     result <- list(role = "assistant", content = list(list(text = "")))
   }
 
-  # Append streaming text
   if (!is.null(chunk$textEvent) && !is.null(chunk$textEvent$systemMessage)) {
     paste(result$content[[1]]$text) <- chunk$textEvent$systemMessage
   }
 
-  # Capture final text + metadata (citations, IDs, etc.)
   if (!is.null(chunk$metadataEvent)) {
     if (
       !is.null(chunk$metadataEvent$finalTextMessage) &&
@@ -342,7 +339,6 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
     result$q_meta <- chunk$metadataEvent
   }
 
-  # Optional plugin/action review, failed attachments
   if (!is.null(chunk$actionReviewEvent)) {
     result$q_action_review <- chunk$actionReviewEvent
   }
@@ -353,12 +349,12 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
   result
 }
 
-# =========================
+# ============================================================================
 # Turn/value adapters
-# =========================
+# ============================================================================
 
 method(value_tokens, ProviderAWSQBusiness) <- function(provider, json) {
-  # Q Chat API (as pasted) doesn't expose token counts.
+  # Q Chat API doesn't advertise token usage; return NA to keep API stable.
   tokens(input = NA_integer_, output = NA_integer_)
 }
 
@@ -381,9 +377,9 @@ method(value_turn, ProviderAWSQBusiness) <- function(
   AssistantTurn(contents, json = result, tokens = unlist(tks), cost = cost)
 }
 
-# =========================
-# ellmer -> Q local JSON shims
-# =========================
+# ============================================================================
+# ellmer -> Q local JSON shims (text-only for now)
+# ============================================================================
 
 method(as_json, list(ProviderAWSQBusiness, Turn)) <- function(
   provider,
@@ -461,10 +457,9 @@ method(as_json, list(ProviderAWSQBusiness, ContentToolResult)) <- function(
   )
 }
 
-# =========================
-# Credential helpers reused
-# =========================
+# ============================================================================
+# Credential helpers reused from Bedrock provider:
 # - paws_credentials()
 # - locate_aws_credentials()
 # - aws_creds_cache()
-# are reused from your Bedrock provider.
+# ============================================================================

@@ -23,7 +23,8 @@ NULL
 #' @param conversation_id Optional conversationId to continue a thread.
 #' @param parent_message_id Optional parent message ID (to thread replies).
 #' @param params Common model params; usually ignored by Q Chat (kept for API symmetry).
-#' @param api_args Named list merged into request body (e.g. configurationEvent, attachmentEvent).
+#' @param api_args Named list merged into request body (e.g. configurationEvent for streaming,
+#'   or chatMode/chatModeConfiguration/attributeFilter for sync).
 #' @param api_headers Named character vector of extra headers.
 #' @inheritParams chat_openai
 #' @inherit chat_openai return
@@ -108,7 +109,7 @@ provider_aws_qbusiness <- function(
     paste0(as.character(user_groups), collapse = ",")
   }
 
-  # IMPORTANT: Provider requires a 'model' property; Q doesn't use it, so set "".
+  # Provider requires 'model'; Q doesn't use it, so set "".
   ProviderAWSQBusiness(
     name = "AWS/QBusiness",
     model = "",
@@ -178,8 +179,8 @@ method(base_request_error, ProviderAWSQBusiness) <- function(provider, req) {
   })
 }
 
-# Keep a param mapper for symmetry; typically Q Chat ignores these unless you
-# pass them via configurationEvent.
+# Keep a param mapper for symmetry; typically Q Chat ignores these unless you pass
+# them via configurationEvent (stream) or chatMode/chatModeConfiguration (sync).
 method(chat_params, ProviderAWSQBusiness) <- function(provider, params) {
   standardise_params(
     params,
@@ -193,7 +194,7 @@ method(chat_params, ProviderAWSQBusiness) <- function(provider, params) {
 }
 
 # ============================================================================
-# Build the chat request (override default Provider method)
+# Build the chat request (supports streaming & non-streaming/sync)
 # ============================================================================
 
 method(chat_request, ProviderAWSQBusiness) <- function(
@@ -203,7 +204,7 @@ method(chat_request, ProviderAWSQBusiness) <- function(
   tools = list(),
   type = NULL
 ) {
-  # POST /applications/{applicationId}/conversations?clientToken=...&conversationId=...&parentMessageId=...&userId=...&userGroups=...
+  # Endpoint: POST /applications/{applicationId}/conversations[?sync]
   req <- base_request(provider)
   req <- req_url_path_append(
     req,
@@ -221,10 +222,17 @@ method(chat_request, ProviderAWSQBusiness) <- function(
   if (!is.null(provider@user_groups)) {
     q$userGroups <- provider@user_groups
   }
+
+  if (!stream) {
+    # Non-streaming uses ChatSync with ?sync
+    # Ref: ChatSync Request Syntax uses '?sync' plus userGroups & userId in query
+    # (body uses 'userMessage', 'attachments', and top-level config fields)
+    # :contentReference[oaicite:0]{index=0}
+    q$sync <- TRUE
+  }
   req <- req_url_query(req, !!!compact(q))
 
-  # Body is a sequence of "events": textEvent / configurationEvent / attachmentEvent / endOfInputEvent
-  # System prompt: inline into first user message (Q has no native 'system' field).
+  # ----- Gather message text & optional system prompt -----
   msgs <- compact(as_json(provider, turns))
 
   if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
@@ -239,15 +247,14 @@ method(chat_request, ProviderAWSQBusiness) <- function(
           msgs[[2]]$content[[1]]$text
         )
       }
-    } else {
-      # If there is no immediate user message, we fall back below to send sys as textEvent
     }
     keep <- !vapply(turns, is_system_turn, logical(1))
     msgs <- msgs[keep]
   }
 
-  # Take only the last user message as the input for this call
+  # Last user message is the input text for this call
   last_user_text <- NULL
+  last_user_idx <- NA_integer_
   if (length(msgs)) {
     for (i in rev(seq_along(msgs))) {
       if (identical(msgs[[i]]$role, "user")) {
@@ -257,31 +264,88 @@ method(chat_request, ProviderAWSQBusiness) <- function(
           FUN.VALUE = character(1)
         )
         last_user_text <- paste0(txts, collapse = "")
+        last_user_idx <- i
         break
       }
     }
   }
 
-  body <- list()
-  if (!is.null(last_user_text) && nzchar(last_user_text)) {
-    body$textEvent <- list(userMessage = last_user_text)
-  } else if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
-    body$textEvent <- list(userMessage = turns[[1]]@text)
+  # ----- Collect uploadable attachments (PDF / inline images) from that last user turn -----
+  atts <- collect_q_attachments_from_turn(msgs, last_user_idx)
+
+  # ----- Build body for streaming vs sync -----
+  if (isTRUE(stream)) {
+    # Streaming Chat: body is a sequence of *events*
+    # textEvent + (optional) attachmentEvent + endOfInputEvent (+ configurationEvent via extra_args)
+    body <- list()
+    if (!is.null(last_user_text) && nzchar(last_user_text)) {
+      body$textEvent <- list(userMessage = last_user_text)
+    } else if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
+      body$textEvent <- list(userMessage = turns[[1]]@text)
+    }
+
+    # Single attachmentEvent supported per request (we take the first if present)
+    if (length(atts)) {
+      body$attachmentEvent <- list(
+        attachment = list(
+          name = atts[[1]]$name,
+          data = atts[[1]]$data
+        )
+      )
+    }
+
+    # Merge user-supplied events (e.g., configurationEvent)
+    body <- modify_list(body, provider@extra_args)
+
+    # Required end-of-input marker
+    body$endOfInputEvent <- list()
+
+    req <- req_body_json(req, compact(body))
+    req <- req_headers(req, !!!provider@extra_headers)
+    req
+  } else {
+    # Non-streaming ChatSync: body uses different field names
+    # - 'userMessage' (string)
+    # - 'attachments' (array)
+    # - top-level config fields (chatMode, chatModeConfiguration, attributeFilter, etc.)
+    # :contentReference[oaicite:1]{index=1}
+
+    sync_body <- list()
+    if (!is.null(last_user_text) && nzchar(last_user_text)) {
+      sync_body$userMessage <- last_user_text
+    } else if (length(turns) >= 1 && is_system_turn(turns[[1]])) {
+      sync_body$userMessage <- turns[[1]]@text
+    }
+
+    if (length(atts)) {
+      sync_body$attachments <- lapply(atts, function(a) {
+        list(name = a$name, data = a$data)
+      })
+    }
+
+    # Map select provider@extra_args into sync fields when users supplied streaming-style names
+    # Allow both styles:
+    # - If user provided chatMode/chatModeConfiguration/attributeFilter directly -> keep as-is
+    # - If user provided configurationEvent=list(chatMode=..., chatModeConfiguration=...) -> map them
+    ea <- provider@extra_args
+    if (!is.null(ea$configurationEvent)) {
+      ce <- ea$configurationEvent
+      ea$chatMode <- ea$chatMode %||% ce$chatMode
+      ea$chatModeConfiguration <- ea$chatModeConfiguration %||%
+        ce$chatModeConfiguration
+      ea$attributeFilter <- ea$attributeFilter %||% ce$attributeFilter
+      ea$configurationEvent <- NULL
+    }
+    sync_body <- modify_list(sync_body, ea)
+
+    req <- req_body_json(req, compact(sync_body))
+    req <- req_headers(req, !!!provider@extra_headers)
+    req
   }
-
-  # Optional: configurationEvent / attachmentEvent / actionExecutionEvent via api_args
-  body <- modify_list(body, provider@extra_args)
-
-  # Required end-of-input marker
-  body$endOfInputEvent <- list()
-
-  req <- req_body_json(req, compact(body))
-  req <- req_headers(req, !!!provider@extra_headers)
-  req
 }
 
 # ============================================================================
-# Streaming helpers (Q uses AWS event streams; reuse the Bedrock reader)
+# Streaming helpers (Q uses AWS event streams; reuse Bedrock reader)
 # ============================================================================
 
 method(chat_resp_stream, ProviderAWSQBusiness) <- function(provider, resp) {
@@ -325,10 +389,12 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
     result <- list(role = "assistant", content = list(list(text = "")))
   }
 
+  # Append streaming text
   if (!is.null(chunk$textEvent) && !is.null(chunk$textEvent$systemMessage)) {
     paste(result$content[[1]]$text) <- chunk$textEvent$systemMessage
   }
 
+  # Capture final text + metadata (citations, IDs, etc.)
   if (!is.null(chunk$metadataEvent)) {
     if (
       !is.null(chunk$metadataEvent$finalTextMessage) &&
@@ -337,8 +403,18 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
       result$content[[1]]$text <- chunk$metadataEvent$finalTextMessage
     }
     result$q_meta <- chunk$metadataEvent
+
+    # Auto-persist conversationId if present
+    if (
+      !is.null(chunk$metadataEvent$conversationId) &&
+        is.character(chunk$metadataEvent$conversationId) &&
+        nzchar(chunk$metadataEvent$conversationId)
+    ) {
+      provider@conversation_id <- chunk$metadataEvent$conversationId
+    }
   }
 
+  # Optional plugin/action review, failed attachments
   if (!is.null(chunk$actionReviewEvent)) {
     result$q_action_review <- chunk$actionReviewEvent
   }
@@ -350,7 +426,7 @@ method(stream_merge_chunks, ProviderAWSQBusiness) <- function(
 }
 
 # ============================================================================
-# Turn/value adapters
+# Non-streaming response (ChatSync) + tokens
 # ============================================================================
 
 method(value_tokens, ProviderAWSQBusiness) <- function(provider, json) {
@@ -363,14 +439,31 @@ method(value_turn, ProviderAWSQBusiness) <- function(
   result,
   has_type = FALSE
 ) {
+  # 'result' is either:
+  # - the merged object from stream_merge_chunks() for streaming, or
+  # - the ChatSync JSON response for non-streaming:
+  #     contains 'systemMessage' plus IDs and possibly attributions
+  #     (per API docs for ChatSync response fields)
+  # We normalize both to an AssistantTurn(ContentText).
+
+  # Auto-persist conversationId from sync responses if present
+  if (is.null(result$q_meta) && !is.null(result$conversationId)) {
+    provider@conversation_id <- result$conversationId
+  }
+
   text <- ""
   if (
     !is.null(result$content) &&
       length(result$content) > 0 &&
       !is.null(result$content[[1]]$text)
   ) {
+    # streaming aggregate
     text <- result$content[[1]]$text
+  } else if (!is.null(result$systemMessage)) {
+    # sync response
+    text <- result$systemMessage
   }
+
   contents <- list(ContentText(text))
   tks <- value_tokens(provider, result)
   cost <- get_token_cost(provider, tks)
@@ -378,7 +471,7 @@ method(value_turn, ProviderAWSQBusiness) <- function(
 }
 
 # ============================================================================
-# ellmer -> Q local JSON shims (text-only for now)
+# ellmer -> Q local JSON shims (text + light attachments)
 # ============================================================================
 
 method(as_json, list(ProviderAWSQBusiness, Turn)) <- function(
@@ -407,24 +500,20 @@ method(as_json, list(ProviderAWSQBusiness, ContentText)) <- function(
   }
 }
 
-method(as_json, list(ProviderAWSQBusiness, ContentImageRemote)) <- function(
-  provider,
-  x,
-  ...
-) {
-  cli::cli_abort(
-    "Q Business Chat adapter currently supports text only (use attachmentEvent)."
-  )
-}
-
+# Accept inline image/PDF as potential attachments (we don't send them here; we collect in chat_request)
 method(as_json, list(ProviderAWSQBusiness, ContentImageInline)) <- function(
   provider,
   x,
   ...
 ) {
-  cli::cli_abort(
-    "Q Business Chat adapter currently supports text only (use attachmentEvent)."
-  )
+  # Represent as a placeholder block so we can locate it later in chat_request
+  list(list(
+    .ellmer_q_attachment = list(
+      kind = "image",
+      name = x@name %||% "image",
+      data = x@data
+    )
+  ))
 }
 
 method(as_json, list(ProviderAWSQBusiness, ContentPDF)) <- function(
@@ -432,8 +521,22 @@ method(as_json, list(ProviderAWSQBusiness, ContentPDF)) <- function(
   x,
   ...
 ) {
+  list(list(
+    .ellmer_q_attachment = list(
+      kind = "pdf",
+      name = x@name %||% "document.pdf",
+      data = x@data
+    )
+  ))
+}
+
+method(as_json, list(ProviderAWSQBusiness, ContentImageRemote)) <- function(
+  provider,
+  x,
+  ...
+) {
   cli::cli_abort(
-    "Q Business Chat adapter: PDF support not wired (use attachmentEvent)."
+    "Q Business Chat adapter: remote images aren't supported; use inline bytes or upload."
   )
 }
 
@@ -454,6 +557,60 @@ method(as_json, list(ProviderAWSQBusiness, ContentToolResult)) <- function(
 ) {
   cli::cli_abort(
     "Q Business plugins/action responses not auto-mapped from ToolResult."
+  )
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Extract inline attachments from the last user turn
+collect_q_attachments_from_turn <- function(msgs, user_idx) {
+  if (is.na(user_idx) || user_idx < 1 || user_idx > length(msgs)) {
+    return(list())
+  }
+  cont <- msgs[[user_idx]]$content
+  out <- list()
+  for (c in cont) {
+    if (!is.null(c$.ellmer_q_attachment)) {
+      a <- c$.ellmer_q_attachment
+      # jsonlite will base64-encode raw vectors for us
+      out[[length(out) + 1]] <- list(name = a$name, data = a$data)
+    }
+  }
+  out
+}
+
+# Utility: pull Q citations from a turn produced by chat_aws_q()
+# Returns a data.frame with citationNumber, title, url, snippet (if present).
+#' @keywords internal
+#' @noRd
+extract_q_citations <- function(turn) {
+  meta <- NULL
+  if (!is.null(turn@json$q_meta)) {
+    meta <- turn@json$q_meta
+  } else if (!is.null(turn@json$metadataEvent)) {
+    meta <- turn@json$metadataEvent
+  }
+  if (is.null(meta) || is.null(meta$sourceAttributions)) {
+    return(data.frame(
+      citationNumber = integer(),
+      title = character(),
+      url = character(),
+      snippet = character()
+    ))
+  }
+  sats <- meta$sourceAttributions
+  data.frame(
+    citationNumber = vapply(
+      sats,
+      function(x) x$citationNumber %||% NA_integer_,
+      integer(1)
+    ),
+    title = vapply(sats, function(x) x$title %||% "", character(1)),
+    url = vapply(sats, function(x) x$url %||% "", character(1)),
+    snippet = vapply(sats, function(x) x$snippet %||% "", character(1)),
+    stringsAsFactors = FALSE
   )
 }
 

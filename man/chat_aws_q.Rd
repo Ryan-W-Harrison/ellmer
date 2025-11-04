@@ -42,7 +42,8 @@ we inline this into the first user message for now.}
 
 \item{params}{Common model params; usually ignored by Q Chat (kept for API symmetry).}
 
-\item{api_args}{Named list merged into request body (e.g. configurationEvent, attachmentEvent).}
+\item{api_args}{Named list merged into request body (e.g. configurationEvent for streaming,
+or chatMode/chatModeConfiguration/attributeFilter for sync).}
 
 \item{api_headers}{Named character vector of extra headers.}
 

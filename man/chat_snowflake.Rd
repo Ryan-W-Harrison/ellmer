@@ -76,7 +76,7 @@ Note that Snowflake-hosted models do not support images.
 }
 }
 \examples{
-\dontshow{if (has_credentials("snowflake")) withAutoprint(\{ # examplesIf}
+\dontshow{if (has_credentials("snowflake")) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
 chat <- chat_snowflake()
 chat$chat("Tell me a joke in the form of a SQL query.")
 \dontshow{\}) # examplesIf}

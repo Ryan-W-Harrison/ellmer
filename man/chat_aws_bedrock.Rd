@@ -90,6 +90,7 @@ chat$chat("Tell me three jokes about statisticians")
 \seealso{
 Other chatbots: 
 \code{\link{chat_anthropic}()},
+\code{\link{chat_aws_q}()},
 \code{\link{chat_azure_openai}()},
 \code{\link{chat_cloudflare}()},
 \code{\link{chat_databricks}()},
